@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone
+import asyncio
 import httpx
 from bs4 import BeautifulSoup
 import re
@@ -99,11 +100,10 @@ RAW_URLS = [
     "https://eadept.e-land.gov.tw/",
 ]
 
-# 之後若你想要改「名稱」，可以把 name 換成中文；目前先用網址當名稱
 SITES = [{"name": url.strip(), "url": url.strip()} for url in RAW_URLS]
 
 
-# ---- 回傳資料的格式定義 ----
+# ---- 回傳資料格式 ----
 class SiteResult(BaseModel):
     name: str
     url: str
@@ -119,7 +119,7 @@ class CheckAllResponse(BaseModel):
     results: List[SiteResult]
 
 
-# ---- 日期解析規則 ----
+# ---- 日期解析 ----
 DATE_PATTERNS = [
     r"\d{4}[/-]\d{1,2}[/-]\d{1,2}",     # 2025/11/26 或 2025-11-26
     r"\d{3}[/-]\d{1,2}[/-]\d{1,2}",     # 114/11/26（民國年）
@@ -141,87 +141,87 @@ def parse_date(text: str) -> Optional[datetime]:
                 return dateparser.parse(ds)
             except Exception:
                 pass
-    # 若前面沒抓到，再交給 dateparser 自己亂試一次
     try:
         return dateparser.parse(text, fuzzy=True)
     except Exception:
         return None
 
 
-# ---- 單一站台檢查 ----
-async def check_one_site(name: str, url: str) -> SiteResult:
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+# ---- 單一站台檢查（並行版）----
+async def check_one_site(name: str, url: str, client: httpx.AsyncClient, sem: asyncio.Semaphore) -> SiteResult:
+    async with sem:  # 控制最多同時幾個請求，避免太炸
+        try:
             resp = await client.get(url)
-        html = resp.text
-        soup = BeautifulSoup(html, "html.parser")
+            html = resp.text
+            soup = BeautifulSoup(html, "html.parser")
 
-        # 嘗試找常見「最新消息」區塊
-        candidate_blocks = []
-        selectors = [
-            ".news", ".latest", ".list", ".announcement",
-            "#news", "#latest", "#announcement"
-        ]
-        for sel in selectors:
-            candidate_blocks.extend(soup.select(sel))
+            candidate_blocks = []
+            selectors = [
+                ".news", ".latest", ".list", ".announcement",
+                "#news", "#latest", "#announcement"
+            ]
+            for sel in selectors:
+                candidate_blocks.extend(soup.select(sel))
 
-        if not candidate_blocks:
-            # 找不到就整頁掃一次
-            candidate_blocks = [soup]
+            if not candidate_blocks:
+                candidate_blocks = [soup]
 
-        best_date: Optional[datetime] = None
-        best_title: Optional[str] = None
+            best_date: Optional[datetime] = None
+            best_title: Optional[str] = None
 
-        for block in candidate_blocks:
-            text = block.get_text(" ", strip=True)
-            d = parse_date(text)
-            if d:
-                if (best_date is None) or (d > best_date):
-                    best_date = d
-                    # 標題先抓附近一段文字，之後交給 GPT 再縮成 10 個字
-                    best_title = text[:40]
+            for block in candidate_blocks:
+                text = block.get_text(" ", strip=True)
+                d = parse_date(text)
+                if d:
+                    if (best_date is None) or (d > best_date):
+                        best_date = d
+                        best_title = text[:40]
 
-        if not best_date:
+            if not best_date:
+                return SiteResult(
+                    name=name,
+                    url=url,
+                    status="unknown",
+                    note="頁面無法解析日期，需人工確認",
+                )
+
+            today = datetime.now(timezone.utc)
+            days = (today - best_date.astimezone(timezone.utc)).days
+            status = "ok" if days <= 30 else "outdated"
+
+            return SiteResult(
+                name=name,
+                url=url,
+                latest_date=best_date.date().isoformat(),
+                latest_title=best_title or "",
+                days_since=days,
+                status=status,
+                note="",
+            )
+
+        except Exception as e:
             return SiteResult(
                 name=name,
                 url=url,
                 status="unknown",
-                note="頁面無法解析日期，需人工確認",
+                note=f"連線或解析錯誤：{e}",
             )
 
-        today = datetime.now(timezone.utc)
-        days = (today - best_date.astimezone(timezone.utc)).days
-        status = "ok" if days <= 30 else "outdated"
 
-        return SiteResult(
-            name=name,
-            url=url,
-            latest_date=best_date.date().isoformat(),
-            latest_title=best_title or "",
-            days_since=days,
-            status=status,
-            note="",
-        )
-
-    except Exception as e:
-        return SiteResult(
-            name=name,
-            url=url,
-            status="unknown",
-            note=f"連線或解析錯誤：{e}",
-        )
-
-
-# ---- 全部站台檢查的 API ----
+# ---- 全部站台檢查（並行版）----
 @app.get("/check-all", response_model=CheckAllResponse)
 async def check_all():
     now = datetime.now(timezone.utc).isoformat()
-    results: List[SiteResult] = []
 
-    # 先用「一個一個跑」，雖然慢一點，但邏輯清楚也比較不容易出錯
-    for site in SITES:
-        res = await check_one_site(site["name"], site["url"])
-        results.append(res)
+    # 同時最多跑 10 個站台，timeout 設 8 秒
+    sem = asyncio.Semaphore(10)
+
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        tasks = [
+            check_one_site(site["name"], site["url"], client, sem)
+            for site in SITES
+        ]
+        results: List[SiteResult] = await asyncio.gather(*tasks)
 
     return CheckAllResponse(
         checked_at=now,
